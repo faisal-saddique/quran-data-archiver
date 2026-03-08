@@ -154,52 +154,90 @@ SELECT id, name, author_name, language_name, slug FROM resources_tafsirs;
 
 ## Installation
 
+This project uses [uv](https://docs.astral.sh/uv/) — a fast, modern Python package manager.
+
 ```bash
+# Install uv (once, system-wide)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
 # Clone
 git clone https://github.com/faisal-saddique/quran-data-archiver.git
 cd quran-data-archiver
-
-# Install the single dependency
-pip install requests
-
-# Run
-python quran_dump.py
 ```
 
 ---
 
 ## Usage
 
+### Option A — uv project (recommended)
+
+```bash
+# Install dependencies and run (uv handles the venv automatically)
+uv run quran_dump.py
+
+# With flags
+uv run quran_dump.py --all-translations
+uv run quran_dump.py --all-tafsirs
+uv run quran_dump.py --chapter 36
+```
+
+`uv run` reads `pyproject.toml`, creates a virtual environment, installs `requests`, and runs the script — all in one command. The lockfile (`uv.lock`) guarantees reproducible installs.
+
+### Option B — zero-setup single script (PEP 723 inline metadata)
+
+The script embeds its own dependency declaration at the top. You can run it directly via `uv run` **without cloning the project**:
+
+```bash
+uv run https://raw.githubusercontent.com/faisal-saddique/quran-data-archiver/main/quran_dump.py
+```
+
+Or locally without installing anything first:
+
+```bash
+uv run quran_dump.py          # uv auto-installs requests into an isolated cache
+```
+
+### Option C — plain Python
+
+```bash
+pip install requests
+python quran_dump.py
+```
+
+---
+
+## All flags
+
 ```bash
 # Full download — default translations (9) + Ibn Kathir tafsir
-python quran_dump.py
+uv run quran_dump.py
 
 # All 146 translations across all languages
-python quran_dump.py --all-translations
+uv run quran_dump.py --all-translations
 
 # All 23 tafsirs
-python quran_dump.py --all-tafsirs
+uv run quran_dump.py --all-tafsirs
 
 # Both complete
-python quran_dump.py --all-translations --all-tafsirs
+uv run quran_dump.py --all-translations --all-tafsirs
 
 # Skip tafsirs (faster)
-python quran_dump.py --skip-tafsirs
+uv run quran_dump.py --skip-tafsirs
 
 # Resource lists only (fast, no verses)
-python quran_dump.py --skip-verses --skip-tafsirs --skip-chapter-info --skip-audio
+uv run quran_dump.py --skip-verses --skip-tafsirs --skip-chapter-info --skip-audio
 
 # Test a single chapter
-python quran_dump.py --chapter 36
+uv run quran_dump.py --chapter 36
 
 # Slower/more polite (default: 0.6s + ±0.3s jitter)
-python quran_dump.py --delay 1.5
+uv run quran_dump.py --delay 1.5
 
 # Custom DB path
-python quran_dump.py --db /path/to/my.sqlite3
+uv run quran_dump.py --db /path/to/my.sqlite3
 
 # Specific translations by ID
-python quran_dump.py --translations 131,85,95,97
+uv run quran_dump.py --translations 131,85,95,97
 ```
 
 ### Flags

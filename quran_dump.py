@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "requests>=2.31.0",
+# ]
+# ///
 """
 quran_dump.py — Complete Quran.com content archiver (v2).
 
@@ -244,6 +250,7 @@ CREATE TABLE IF NOT EXISTS resources_translations (
     author_name   TEXT,
     slug          TEXT,
     language_name TEXT,
+    language_iso  TEXT,
     raw_json      TEXT
 );
 

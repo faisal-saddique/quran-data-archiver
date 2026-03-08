@@ -1,0 +1,16 @@
+[project]
+name = "quran-data-archiver"
+version = "0.1.0"
+description = "Complete Quran.com content archiver — all verses, words, translations, tafsirs, chapter info, and audio URLs in a relational SQLite database"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+dependencies = [
+    "requests>=2.31.0",
+]
+
+[project.urls]
+Repository = "https://github.com/faisal-saddique/quran-data-archiver"
+
+[tool.uv]
+dev-dependencies = []
