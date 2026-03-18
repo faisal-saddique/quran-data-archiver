@@ -191,6 +191,14 @@ def _get(base: str, path: str, params: dict | None = None) -> dict:
             if r.status_code == 404:
                 log.debug("404 → %s", url)
                 return {}
+            if r.status_code in (500, 502, 503, 504):
+                wait = 10 * (attempt + 1)
+                log.warning(
+                    "Server error %d [%d/5]. Retrying in %ds …",
+                    r.status_code, attempt + 1, wait,
+                )
+                time.sleep(wait)
+                continue
             r.raise_for_status()
             text = r.text.strip()
             if not text:
@@ -757,7 +765,13 @@ def dump_footnotes(conn: sqlite3.Connection) -> None:
     errors = 0
 
     for fn_id in pending:
-        data = qdc(f"/foot_notes/{fn_id}")
+        try:
+            data = qdc(f"/foot_notes/{fn_id}")
+        except Exception as exc:
+            log.warning("  footnote %d: request failed (%s) — skipping", fn_id, exc)
+            errors += 1
+            continue
+
         fn = data.get("foot_note", {})
         if fn:
             conn.execute(
