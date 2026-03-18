@@ -51,7 +51,9 @@ import random
 import re
 import sqlite3
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -725,7 +727,58 @@ def dump_verses(conn: sqlite3.Connection, chapters: list[dict],
 
 # ── Step 3: Footnotes ─────────────────────────────────────────────────────────
 
-def dump_footnotes(conn: sqlite3.Connection) -> None:
+# Thread-local storage for per-thread HTTP sessions (avoids sharing mutable
+# session state across threads while still reusing connections within a thread).
+_tls = threading.local()
+
+def _footnote_session() -> requests.Session:
+    """Return a QDC session local to the current thread, creating if needed."""
+    if not hasattr(_tls, "session"):
+        _tls.session = _make_session(QDC_HEADERS)
+    return _tls.session
+
+
+def _fetch_one_footnote(fn_id: int, delay: float) -> dict:
+    """Fetch a single footnote from the QDC API (runs in a worker thread).
+
+    Returns the parsed JSON dict (may be empty on 404/error).
+    Raises on unrecoverable errors after retries.
+    """
+    time.sleep(max(0.05, delay + random.uniform(-delay * 0.3, delay * 0.3)))
+    session = _footnote_session()
+    url = f"{QDC_URL}/foot_notes/{fn_id}"
+
+    for attempt in range(5):
+        try:
+            r = session.get(url, timeout=25)
+            if r.status_code == 429:
+                wait = 45 + attempt * 20
+                log.warning("[fn %d] Rate-limited. Sleeping %ds…", fn_id, wait)
+                time.sleep(wait)
+                continue
+            if r.status_code == 404:
+                return {}
+            if r.status_code in (500, 502, 503, 504):
+                wait = 10 * (attempt + 1)
+                log.debug("[fn %d] %d — retry in %ds", fn_id, r.status_code, wait)
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            text = r.text.strip()
+            return json.loads(text) if text else {}
+        except requests.exceptions.ConnectionError as exc:
+            wait = 4 * (2 ** attempt)
+            log.debug("[fn %d] ConnectionError: %s — retry in %ds", fn_id, exc, wait)
+            _tls.session = _make_session(QDC_HEADERS)  # fresh session
+            time.sleep(wait)
+        except requests.exceptions.Timeout:
+            time.sleep(10 * (attempt + 1))
+
+    log.warning("[fn %d] All retries exhausted", fn_id)
+    return {}
+
+
+def dump_footnotes(conn: sqlite3.Connection, workers: int = 10, delay: float = 0.2) -> None:
     """Fetch every unique footnote referenced across all stored translations.
 
     Translation texts contain markers like ``<sup foot_note=227140>1</sup>``.
@@ -733,20 +786,25 @@ def dump_footnotes(conn: sqlite3.Connection) -> None:
     ``GET /foot_notes/{id}`` on the QDC proxy, then stores the result in the
     ``footnotes`` table.
 
-    Fully resumable: any IDs already in the table are skipped.
+    Uses a thread pool (``workers`` threads) for parallel HTTP fetching.
+    All DB writes are serialised on the calling thread.
+    Fully resumable: IDs already in the table are skipped.
     """
-    log.info("━━━ Step 3/7: Footnotes ━━━")
+    log.info("━━━ Step 3/7: Footnotes (workers=%d, delay=%.2fs) ━━━", workers, delay)
     task_key = "footnotes:all"
 
-    # Scan all translation texts to collect unique footnote IDs
     log.info("  Scanning translations for footnote IDs…")
-    rows = conn.execute("SELECT text FROM translations WHERE text IS NOT NULL").fetchall()
+    rows = conn.execute(
+        "SELECT text FROM translations WHERE text IS NOT NULL"
+    ).fetchall()
     all_ids: set[int] = set()
     for (text,) in rows:
         for m in FOOTNOTE_RE.finditer(text):
             all_ids.add(int(m.group(1)))
 
-    existing: set[int] = {r[0] for r in conn.execute("SELECT id FROM footnotes").fetchall()}
+    existing: set[int] = {
+        r[0] for r in conn.execute("SELECT id FROM footnotes").fetchall()
+    }
     pending = sorted(all_ids - existing)
 
     log.info(
@@ -763,33 +821,43 @@ def dump_footnotes(conn: sqlite3.Connection) -> None:
     _start(conn, task_key)
     fetched = 0
     errors = 0
+    total = len(pending)
 
-    for fn_id in pending:
-        try:
-            data = qdc(f"/foot_notes/{fn_id}")
-        except Exception as exc:
-            log.warning("  footnote %d: request failed (%s) — skipping", fn_id, exc)
-            errors += 1
-            continue
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        # Submit all jobs; per-thread delay staggers the initial burst
+        future_to_id = {
+            executor.submit(_fetch_one_footnote, fn_id, delay): fn_id
+            for fn_id in pending
+        }
+        for future in as_completed(future_to_id):
+            fn_id = future_to_id[future]
+            try:
+                data = future.result()
+            except Exception as exc:
+                log.warning("  fn %d: failed (%s)", fn_id, exc)
+                errors += 1
+                continue
 
-        fn = data.get("foot_note", {})
-        if fn:
-            conn.execute(
-                "INSERT OR REPLACE INTO footnotes(id, text, language_name, language_id) "
-                "VALUES(?, ?, ?, ?)",
-                (fn["id"], fn.get("text"), fn.get("language_name"), fn.get("language_id")),
-            )
-            conn.commit()
-            fetched += 1
-        else:
-            log.debug("  footnote %d: empty response", fn_id)
-            errors += 1
+            fn = data.get("foot_note", {})
+            if fn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO footnotes"
+                    "(id, text, language_name, language_id) VALUES(?,?,?,?)",
+                    (fn["id"], fn.get("text"),
+                     fn.get("language_name"), fn.get("language_id")),
+                )
+                conn.commit()
+                fetched += 1
+            else:
+                errors += 1
 
-        if fetched % 500 == 0 and fetched:
-            log.info("  … %d / %d fetched", fetched, len(pending))
+            done_count = fetched + errors
+            if done_count % 500 == 0:
+                log.info("  … %d / %d processed (%d ok, %d err)",
+                         done_count, total, fetched, errors)
 
     _complete(conn, task_key, len(existing) + fetched)
-    log.info("  → %d footnotes fetched (%d errors)", fetched, errors)
+    log.info("  → %d footnotes stored (%d errors)", fetched, errors)
 
 
 # ── Step 4: Tafsirs ───────────────────────────────────────────────────────────
@@ -987,6 +1055,8 @@ def main():
     p.add_argument("--skip-verses", action="store_true")
     p.add_argument("--skip-footnotes", action="store_true",
                    help="Skip footnote download (requires translations to be present)")
+    p.add_argument("--footnote-workers", type=int, default=10,
+                   help="Parallel HTTP workers for footnote download (default: 10)")
     p.add_argument("--skip-tafsirs", action="store_true")
     p.add_argument("--skip-chapter-info", action="store_true")
     p.add_argument("--skip-audio", action="store_true")
@@ -1028,7 +1098,7 @@ def main():
         dump_verses(conn, chapters, translation_ids, args.mushaf)
 
     if not args.skip_footnotes:
-        dump_footnotes(conn)
+        dump_footnotes(conn, workers=args.footnote_workers, delay=_delay)
 
     if not args.skip_tafsirs:
         dump_tafsirs(conn, chapters, tafsir_slugs)
