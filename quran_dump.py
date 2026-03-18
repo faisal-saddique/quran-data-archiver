@@ -12,7 +12,7 @@ Downloads EVERYTHING from Quran.com and stores it in a fully relational
 SQLite database. Resumable — re-run any time and it picks up where it left off.
 
 APIs used:
-  QDC proxy:  https://quran.com/api/proxy/content/api/qdc   (verses, words, translations, tafsirs)
+  QDC proxy:  https://quran.com/api/proxy/content/api/qdc   (verses, words, translations, tafsirs, footnotes)
   Public V4:  https://api.quran.com/api/v4                  (chapter info, verse audio, chapter audio)
   Word audio: https://audio.qurancdn.com/wbw/               (CDN — URLs stored, not downloaded)
   Verse audio:https://download.quranicaudio.com/            (CDN — URLs stored, not downloaded)
@@ -23,6 +23,7 @@ Content captured:
   ✓ 6236 verses (4 Arabic text variants + structural fields)
   ✓ ~77 000 words (4 scripts + transliteration + EN translation + audio URL)
   ✓ Translations  — 9 default (EN×6 + UR×3), or --all-translations for all 146
+  ✓ Footnotes     — all unique footnotes referenced in downloaded translations
   ✓ Tafsirs       — Ibn Kathir EN default, or --all-tafsirs for all 23
   ✓ Chapter intro text (Maududi background) in EN + UR + AR
   ✓ Verse-level audio URLs for all 20 reciters
@@ -37,6 +38,7 @@ Usage:
   python quran_dump.py --all-tafsirs      # all 23 tafsirs
   python quran_dump.py --chapter 2       # single chapter (testing)
   python quran_dump.py --skip-tafsirs    # skip tafsir download
+  python quran_dump.py --skip-footnotes  # skip footnote download
   python quran_dump.py --delay 1.0       # be more polite
 """
 
@@ -46,11 +48,17 @@ import argparse
 import json
 import logging
 import random
+import re
 import sqlite3
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+# Matches both quoted and unquoted foot_note attributes:
+#   <sup foot_note=227140>1</sup>
+#   <sup foot_note="176997">1</sup>
+FOOTNOTE_RE = re.compile(r'<sup\s+foot_note="?(\d+)"?>', re.IGNORECASE)
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -431,6 +439,15 @@ CREATE TABLE IF NOT EXISTS pages_lookup (
     PRIMARY KEY (chapter_id, mushaf)
 );
 
+-- ═══ Footnotes ══════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS footnotes (
+    id            INTEGER PRIMARY KEY,   -- quran.com foot_note ID
+    text          TEXT,                  -- footnote content
+    language_name TEXT,
+    language_id   INTEGER
+);
+
 -- ═══ Progress tracking ══════════════════════════════════════════════════════
 
 CREATE TABLE IF NOT EXISTS download_progress (
@@ -483,7 +500,7 @@ def _error(conn: sqlite3.Connection, key: str, msg: str):
 # ── Step 1: Resource lists ────────────────────────────────────────────────────
 
 def dump_resources(conn: sqlite3.Connection) -> list[dict]:
-    log.info("━━━ Step 1/6: Resource lists ━━━")
+    log.info("━━━ Step 1/7: Resource lists ━━━")
 
     # Languages
     if not _done(conn, "res:languages"):
@@ -603,7 +620,7 @@ def _parse_word(w: dict, verse_id: int, verse_key: str) -> tuple:
 def dump_verses(conn: sqlite3.Connection, chapters: list[dict],
                 translation_ids: list[int], mushaf: int):
     trans_param = ",".join(str(t) for t in translation_ids)
-    log.info("━━━ Step 2/6: Verses + Words + Translations  [%s] ━━━", trans_param)
+    log.info("━━━ Step 2/7: Verses + Words + Translations  [%s] ━━━", trans_param)
     total = len(chapters)
 
     for idx, ch in enumerate(chapters, 1):
@@ -698,10 +715,73 @@ def dump_verses(conn: sqlite3.Connection, chapters: list[dict],
     log.info("  Pages lookup done for %d chapters.", len(chapters))
 
 
-# ── Step 3: Tafsirs ───────────────────────────────────────────────────────────
+# ── Step 3: Footnotes ─────────────────────────────────────────────────────────
+
+def dump_footnotes(conn: sqlite3.Connection) -> None:
+    """Fetch every unique footnote referenced across all stored translations.
+
+    Translation texts contain markers like ``<sup foot_note=227140>1</sup>``.
+    This step resolves each unique foot_note ID to its full text by calling
+    ``GET /foot_notes/{id}`` on the QDC proxy, then stores the result in the
+    ``footnotes`` table.
+
+    Fully resumable: any IDs already in the table are skipped.
+    """
+    log.info("━━━ Step 3/7: Footnotes ━━━")
+    task_key = "footnotes:all"
+
+    # Scan all translation texts to collect unique footnote IDs
+    log.info("  Scanning translations for footnote IDs…")
+    rows = conn.execute("SELECT text FROM translations WHERE text IS NOT NULL").fetchall()
+    all_ids: set[int] = set()
+    for (text,) in rows:
+        for m in FOOTNOTE_RE.finditer(text):
+            all_ids.add(int(m.group(1)))
+
+    existing: set[int] = {r[0] for r in conn.execute("SELECT id FROM footnotes").fetchall()}
+    pending = sorted(all_ids - existing)
+
+    log.info(
+        "  Unique footnote IDs: %d  (already stored: %d, to fetch: %d)",
+        len(all_ids), len(existing), len(pending),
+    )
+
+    if not pending:
+        if not _done(conn, task_key):
+            _complete(conn, task_key, len(existing))
+        log.info("  All footnotes already downloaded ✓")
+        return
+
+    _start(conn, task_key)
+    fetched = 0
+    errors = 0
+
+    for fn_id in pending:
+        data = qdc(f"/foot_notes/{fn_id}")
+        fn = data.get("foot_note", {})
+        if fn:
+            conn.execute(
+                "INSERT OR REPLACE INTO footnotes(id, text, language_name, language_id) "
+                "VALUES(?, ?, ?, ?)",
+                (fn["id"], fn.get("text"), fn.get("language_name"), fn.get("language_id")),
+            )
+            conn.commit()
+            fetched += 1
+        else:
+            log.debug("  footnote %d: empty response", fn_id)
+            errors += 1
+
+        if fetched % 500 == 0 and fetched:
+            log.info("  … %d / %d fetched", fetched, len(pending))
+
+    _complete(conn, task_key, len(existing) + fetched)
+    log.info("  → %d footnotes fetched (%d errors)", fetched, errors)
+
+
+# ── Step 4: Tafsirs ───────────────────────────────────────────────────────────
 
 def dump_tafsirs(conn: sqlite3.Connection, chapters: list[dict], slugs: list[str]):
-    log.info("━━━ Step 3/6: Tafsirs  [%s] ━━━", ", ".join(slugs))
+    log.info("━━━ Step 4/7: Tafsirs  [%s] ━━━", ", ".join(slugs))
     slug_to_id = {r[0]: r[1] for r in conn.execute("SELECT slug,id FROM resources_tafsirs").fetchall()}
     total = len(chapters)
 
@@ -754,7 +834,7 @@ def dump_tafsirs(conn: sqlite3.Connection, chapters: list[dict], slugs: list[str
 # ── Step 4: Chapter intro text ────────────────────────────────────────────────
 
 def dump_chapter_info(conn: sqlite3.Connection, chapters: list[dict], langs: list[str]):
-    log.info("━━━ Step 4/6: Chapter intro text  [langs: %s] ━━━", ", ".join(langs))
+    log.info("━━━ Step 5/7: Chapter intro text  [langs: %s] ━━━", ", ".join(langs))
     total = len(chapters)
 
     for lang in langs:
@@ -787,7 +867,7 @@ def dump_chapter_info(conn: sqlite3.Connection, chapters: list[dict], langs: lis
 # ── Step 5: Audio URLs ────────────────────────────────────────────────────────
 
 def dump_audio(conn: sqlite3.Connection, chapters: list[dict]):
-    log.info("━━━ Step 5/6: Audio URLs (verse-level + chapter-level) ━━━")
+    log.info("━━━ Step 6/7: Audio URLs (verse-level + chapter-level) ━━━")
 
     # Get all reciter IDs from DB
     reciters = conn.execute("SELECT id, name FROM audio_reciters ORDER BY id").fetchall()
@@ -844,9 +924,9 @@ def dump_audio(conn: sqlite3.Connection, chapters: list[dict]):
 # ── Step 6: Summary ───────────────────────────────────────────────────────────
 
 def print_summary(conn: sqlite3.Connection, db_path: str):
-    log.info("━━━ Step 6/6: Summary ━━━")
+    log.info("━━━ Step 7/7: Summary ━━━")
     tables = ["chapters", "chapter_info", "juzs", "verses", "words",
-              "translations", "tafsirs", "verse_audio", "chapter_audio",
+              "translations", "footnotes", "tafsirs", "verse_audio", "chapter_audio",
               "resources_translations", "resources_tafsirs", "audio_reciters",
               "languages", "recitation_styles", "pages_lookup", "download_progress"]
     size_mb = Path(db_path).stat().st_size / 1_048_576
@@ -891,6 +971,8 @@ def main():
                    help="Download every available tafsir (23 total)")
     p.add_argument("--mushaf", type=int, default=DEFAULT_MUSHAF)
     p.add_argument("--skip-verses", action="store_true")
+    p.add_argument("--skip-footnotes", action="store_true",
+                   help="Skip footnote download (requires translations to be present)")
     p.add_argument("--skip-tafsirs", action="store_true")
     p.add_argument("--skip-chapter-info", action="store_true")
     p.add_argument("--skip-audio", action="store_true")
@@ -930,6 +1012,9 @@ def main():
 
     if not args.skip_verses:
         dump_verses(conn, chapters, translation_ids, args.mushaf)
+
+    if not args.skip_footnotes:
+        dump_footnotes(conn)
 
     if not args.skip_tafsirs:
         dump_tafsirs(conn, chapters, tafsir_slugs)
